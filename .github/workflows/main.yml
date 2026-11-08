@@ -1,123 +1,117 @@
-name: RDP
+
+name: Kali Linux + XFCE + RDP + Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  kali-desktop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
 
     steps:
-      - name: Configure Core RDP Settings
-        shell: pwsh
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Restrict RDP to Tailscale
         run: |
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+          sudo iptables -I INPUT 1 \
+            -p tcp --dport 3389 ! -i tailscale0 -j DROP
 
-          # Disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+          sudo iptables -I INPUT 1 \
+            -i tailscale0 -p tcp --dport 3389 -j ACCEPT
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove existing rule if exists
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-
-          # Allow RDP
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          # Restart RDP service
-          Restart-Service TermService -Force
-
-      - name: Create RDP User with Secure Password
-        shell: pwsh
+      - name: Start Kali Linux Desktop
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          DOWNLOAD_SCRIPT_URL: ${{ secrets.DOWNLOAD_SCRIPT_URL }}
         run: |
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
+          set -e
 
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
+          if [ -z "$RDP_PASSWORD" ]; then
+            echo "RDP_PASSWORD secret is required"
+            exit 1
+          fi
 
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          docker pull kalilinux/kali-rolling:latest
 
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "RDP"
-          }
+          docker run -d \
+            --name kali-rdp \
+            --network host \
+            -e RDP_PASSWORD="$RDP_PASSWORD" \
+            kalilinux/kali-rolling:latest \
+            bash -lc '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
 
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+              apt-get update
 
-          echo "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+              apt-get install -y --no-install-recommends \
+                xfce4 \
+                xrdp \
+                xorgxrdp \
+                dbus-x11 \
+                ca-certificates \
+                curl
 
-      - name: Install Tailscale
-        shell: pwsh
+              useradd -m -s /bin/bash kaliuser
+
+              printf "kaliuser:%s\n" "$RDP_PASSWORD" | chpasswd
+
+              mkdir -p /home/kaliuser/Downloads
+
+              echo "startxfce4" > /home/kaliuser/.xsession
+
+              chown -R kaliuser:kaliuser /home/kaliuser
+
+              /usr/sbin/xrdp-sesman
+
+              exec /usr/sbin/xrdp --nodaemon
+            '
+
+      - name: Download Download.sh
+        env:
+          DOWNLOAD_SCRIPT_URL: ${{ secrets.DOWNLOAD_SCRIPT_URL }}
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
+          if [ -n "$DOWNLOAD_SCRIPT_URL" ]; then
+            docker exec \
+              -e DOWNLOAD_SCRIPT_URL="$DOWNLOAD_SCRIPT_URL" \
+              kali-rdp bash -lc '
+                curl -fL --retry 3 \
+                  "$DOWNLOAD_SCRIPT_URL" \
+                  -o /home/kaliuser/Downloads/Download.sh
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
-          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
-          Remove-Item $installer -Force
+                chmod 700 /home/kaliuser/Downloads/Download.sh
+                chown kaliuser:kaliuser \
+                  /home/kaliuser/Downloads/Download.sh
+              '
+          fi
 
-      - name: Establish Tailscale Connection
-        shell: pwsh
+      - name: Verify RDP
         run: |
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          TS_IP=$(tailscale ip -4 | head -n1)
 
-          & $tsExe up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+          echo "Kali Linux is starting..."
+          echo "Tailscale IP: $TS_IP"
 
-          $tsIP = $null
-          for ($i = 0; $i -lt 12; $i++) {
-            $tsIP = (& $tsExe ip -4).Trim()
-            if ($tsIP) { break }
-            Start-Sleep -Seconds 5
-          }
+          for i in {1..30}; do
+            if timeout 2 bash -c \
+              '</dev/tcp/127.0.0.1/3389' 2>/dev/null; then
+              echo "RDP is ready!"
+              break
+            fi
 
-          if (-not $tsIP) {
-            throw "Tailscale IP not assigned"
-          }
+            sleep 2
+          done
 
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "RDP_ADDRESS=$TS_IP" >> "$GITHUB_ENV"
 
-      - name: Verify RDP Accessibility
-        shell: pwsh
+      - name: Maintain Session
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          echo "Kali Linux XFCE is running"
+          echo "RDP: $RDP_ADDRESS:3389"
+          echo "Username: kaliuser"
 
-          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-
-          if (-not $test.TcpTestSucceeded) {
-            throw "RDP port 3389 is not reachable"
-          }
-
-          Write-Host "RDP is reachable"
-
-      - name: Output RDP Info
-        shell: pwsh
-        run: |
-          Write-Host "=== RDP INFO ==="
-          Write-Host "IP: $env:TAILSCALE_IP"
-          Write-Host "User: $env:RDP_USERNAME"
-          Write-Host "Pass: $env:RDP_PASSWORD"
-          Write-Host "================"
-
-      - name: Maintain Connection
-        shell: pwsh
-        run: |
-          while ($true) {
-            Write-Host "RDP running..."
-            Start-Sleep -Seconds 300
-          }
+          sleep 21000
