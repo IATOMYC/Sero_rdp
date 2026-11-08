@@ -1,21 +1,19 @@
 
-name: Kali Linux + Tailscale + RDP
+name: Kali Linux + XFCE + Tailscale + RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  kali-rdp:
+  kali-desktop:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
-      # 1. Install Tailscale
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      # 2. Connect using Auth Key only
       - name: Connect Tailscale
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
@@ -23,27 +21,24 @@ jobs:
           set -e
 
           if [ -z "$TS_AUTHKEY" ]; then
-            echo "ERROR: TAILSCALE_AUTHKEY is missing"
+            echo "Missing Tailscale Auth Key"
             exit 1
           fi
 
           sudo tailscale up \
-            --authkey="$TS_AUTHKEY" \
+            --auth-key="$TS_AUTHKEY" \
             --hostname="kali-${GITHUB_RUN_ID}"
 
           TS_IP=$(tailscale ip -4 | head -n1)
 
           if [ -z "$TS_IP" ]; then
-            echo "ERROR: Tailscale IP not assigned"
+            echo "Tailscale connection failed"
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
 
-          echo "Tailscale connected: $TS_IP"
-
-      # 3. Protect RDP port
-      - name: Configure RDP Firewall
+      - name: Configure Firewall
         run: |
           sudo iptables -I INPUT 1 \
             -i tailscale0 \
@@ -54,20 +49,18 @@ jobs:
             -p tcp --dport 3389 \
             -j DROP
 
-      # 4. Pull Kali Linux
       - name: Download Kali Linux
         run: |
           docker pull kalilinux/kali-rolling:latest
 
-      # 5. Install Kali XFCE and XRDP
-      - name: Build Kali Desktop
+      - name: Setup Kali XFCE and RDP
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -e
 
           if [ -z "$RDP_PASSWORD" ]; then
-            echo "ERROR: RDP_PASSWORD is missing"
+            echo "Missing RDP_PASSWORD"
             exit 1
           fi
 
@@ -100,8 +93,6 @@ jobs:
 
               echo "exec startxfce4" > /home/kaliuser/.xsession
 
-              chmod 700 /home/kaliuser/.xsession
-
               chown -R kaliuser:kaliuser /home/kaliuser
 
               adduser xrdp ssl-cert || true
@@ -111,46 +102,36 @@ jobs:
               exec /usr/sbin/xrdp --nodaemon
             '
 
-      # 6. Download Download.sh
-      - name: Download Script
+      - name: Download Download.sh
         env:
           DOWNLOAD_SCRIPT_URL: ${{ secrets.DOWNLOAD_SCRIPT_URL }}
         run: |
           if [ -n "$DOWNLOAD_SCRIPT_URL" ]; then
-
             docker exec \
               -e DOWNLOAD_SCRIPT_URL="$DOWNLOAD_SCRIPT_URL" \
               kali-rdp bash -lc '
-
                 curl -fL --retry 3 \
                   "$DOWNLOAD_SCRIPT_URL" \
                   -o /home/kaliuser/Downloads/Download.sh
 
-                chmod 700 \
-                  /home/kaliuser/Downloads/Download.sh
+                chmod 700 /home/kaliuser/Downloads/Download.sh
 
                 chown kaliuser:kaliuser \
                   /home/kaliuser/Downloads/Download.sh
-
               '
-
-            echo "Download.sh downloaded"
-
           else
-            echo "No download URL configured"
+            echo "Download URL not configured"
           fi
 
-      # 7. Verify RDP
       - name: Verify RDP
         run: |
-          echo "Checking RDP service..."
+          set -e
 
           READY=0
 
           for i in {1..60}; do
             if timeout 2 bash -c \
               '</dev/tcp/127.0.0.1/3389' 2>/dev/null; then
-
               READY=1
               break
             fi
@@ -159,30 +140,21 @@ jobs:
           done
 
           if [ "$READY" -ne 1 ]; then
-            echo "ERROR: RDP service failed"
-
             docker logs kali-rdp
-
             exit 1
           fi
 
-          echo "RDP service is ready"
-
           echo "================================"
-          echo "KALI LINUX REMOTE DESKTOP"
+          echo "KALI LINUX XFCE READY"
           echo "================================"
           echo "IP: $TAILSCALE_IP"
           echo "PORT: 3389"
-          echo "USER: kaliuser"
+          echo "USERNAME: kaliuser"
           echo "================================"
 
-      # 8. Keep Runner Alive
-      - name: Maintain Connection
+      - name: Keep Desktop Running
         run: |
-          echo "Kali Linux XFCE is running"
-
           while true; do
-            echo "[$(date)] Kali Desktop Active"
-
+            echo "[$(date)] Kali Linux RDP Active"
             sleep 300
           done
